@@ -1,0 +1,293 @@
+"""Unit tests for the BulkRNABert downstream cancer-classification workflow.
+
+Covers:
+
+* :class:`pyhealth.models.BulkRNABertClassifier` — forward contract,
+  learning signal, mode inference from the sample dataset.
+* :meth:`pyhealth.models.BulkRNABert.encode` — mean-pooled embedding shape
+  for both expression modes.
+* :func:`pyhealth.datasets.load_tcga_cancer_classification_5cohort` — label
+  assignment from a synthetic mapping CSV, and the embedding / identifier
+  CSV row-alignment contract.
+* :func:`pyhealth.datasets.stratified_split_indices` — per-class proportions
+  are preserved.
+* End-to-end Trainer smoke test on a synthetic problem.
+"""
+
+from __future__ import annotations
+
+import tempfile
+import unittest
+from pathlib import Path
+from typing import List
+
+import numpy as np
+import torch
+
+from pyhealth.datasets import (
+    create_sample_dataset,
+    get_dataloader,
+    load_tcga_cancer_classification_5cohort,
+    stratified_split_indices,
+)
+from pyhealth.models import BulkRNABert, BulkRNABertClassifier, BulkRNABertConfig
+from pyhealth.tasks import LABEL_MAP, TCGACancerClassification5Cohort
+from pyhealth.trainer import Trainer
+
+
+def _tiny_config(expression_mode: str = "discrete") -> BulkRNABertConfig:
+    return BulkRNABertConfig(
+        n_genes=16,
+        n_bins=8,
+        embed_dim=12,
+        num_layers=1,
+        num_heads=2,
+        ffn_embed_dim=16,
+        init_gene_embed_dim=12,
+        expression_mode=expression_mode,
+        continuous_hidden_dim=12 if expression_mode == "continuous" else None,
+    )
+
+
+def _make_classifier_dataset(n_per_class: int = 20, embed_dim: int = 12, n_classes: int = 5):
+    """Build a small in-memory classifier dataset with linearly separable means."""
+    rng = np.random.default_rng(0)
+    centers = rng.normal(0.0, 3.0, size=(n_classes, embed_dim)).astype(np.float32)
+    samples: List[dict] = []
+    for cls in range(n_classes):
+        for i in range(n_per_class):
+            emb = centers[cls] + 0.1 * rng.standard_normal(embed_dim).astype(np.float32)
+            samples.append(
+                {
+                    "patient_id": f"s{cls}_{i}",
+                    "embedding": emb,
+                    "label": int(cls),
+                }
+            )
+    task = TCGACancerClassification5Cohort()
+    return create_sample_dataset(
+        samples=samples,
+        input_schema=task.input_schema,
+        output_schema=task.output_schema,
+        task_name=task.task_name,
+        in_memory=True,
+    )
+
+
+class TestBulkRNABertEncode(unittest.TestCase):
+    def test_discrete_shape(self):
+        cfg = _tiny_config("discrete")
+        model = BulkRNABert(dataset=None, config=cfg, feature_key="expression")
+        tokens = torch.randint(0, cfg.n_bins, (3, cfg.n_genes))
+        emb = model.encode(tokens)
+        self.assertEqual(emb.shape, (3, cfg.embed_dim))
+        self.assertEqual(emb.dtype, torch.float32)
+
+    def test_continuous_shape(self):
+        cfg = _tiny_config("continuous")
+        model = BulkRNABert(dataset=None, config=cfg, feature_key="expression")
+        values = torch.rand(3, cfg.n_genes) * 5.0
+        emb = model.encode(values)
+        self.assertEqual(emb.shape, (3, cfg.embed_dim))
+
+    def test_deterministic_eval(self):
+        """encode must run no-mask — same input -> same output."""
+        cfg = _tiny_config("discrete")
+        model = BulkRNABert(dataset=None, config=cfg, feature_key="expression")
+        tokens = torch.randint(0, cfg.n_bins, (2, cfg.n_genes))
+        a = model.encode(tokens)
+        b = model.encode(tokens)
+        torch.testing.assert_close(a, b)
+
+    def test_training_mode_restored(self):
+        cfg = _tiny_config("discrete")
+        model = BulkRNABert(dataset=None, config=cfg, feature_key="expression")
+        model.train()
+        tokens = torch.randint(0, cfg.n_bins, (1, cfg.n_genes))
+        model.encode(tokens)
+        self.assertTrue(model.training)
+
+    def test_shape_mismatch_raises(self):
+        cfg = _tiny_config("discrete")
+        model = BulkRNABert(dataset=None, config=cfg, feature_key="expression")
+        bad = torch.randint(0, cfg.n_bins, (2, cfg.n_genes - 1))
+        with self.assertRaises(ValueError):
+            model.encode(bad)
+
+
+class TestBulkRNABertClassifier(unittest.TestCase):
+    def setUp(self):
+        self.dataset = _make_classifier_dataset(n_per_class=10, embed_dim=12, n_classes=5)
+        self.model = BulkRNABertClassifier(
+            dataset=self.dataset,
+            hidden_sizes=(16, 8),
+            embed_dim=12,
+        )
+
+    def test_mode_and_num_classes(self):
+        self.assertEqual(self.model.mode, "multiclass")
+        self.assertEqual(self.model.num_classes, 5)
+
+    def test_forward_contract(self):
+        loader = get_dataloader(self.dataset, batch_size=4, shuffle=False)
+        batch = next(iter(loader))
+        out = self.model(**batch)
+        self.assertIn("loss", out)
+        self.assertIn("y_prob", out)
+        self.assertIn("y_true", out)
+        self.assertIn("logit", out)
+        self.assertEqual(out["logit"].shape, (4, 5))
+        self.assertEqual(out["y_true"].shape, (4,))
+        self.assertEqual(out["y_prob"].shape, (4, 5))
+        self.assertEqual(out["loss"].dim(), 0)
+
+    def test_backward_learns(self):
+        loader = get_dataloader(self.dataset, batch_size=8, shuffle=True)
+        optim = torch.optim.Adam(self.model.parameters(), lr=5e-3)
+        first_losses = []
+        for i, batch in enumerate(loader):
+            out = self.model(**batch)
+            optim.zero_grad()
+            out["loss"].backward()
+            optim.step()
+            first_losses.append(float(out["loss"].detach()))
+            if i >= 2:
+                break
+        last_losses = []
+        for _ in range(20):
+            for batch in loader:
+                out = self.model(**batch)
+                optim.zero_grad()
+                out["loss"].backward()
+                optim.step()
+                last_losses.append(float(out["loss"].detach()))
+        self.assertLess(
+            sum(last_losses[-3:]) / 3,
+            sum(first_losses) / len(first_losses),
+        )
+
+    def test_wrong_input_dim_raises(self):
+        bad_batch = {
+            "embedding": torch.randn(2, 8),  # wrong embed_dim
+            "label": torch.zeros(2, dtype=torch.long),
+        }
+        with self.assertRaises(ValueError):
+            self.model(**bad_batch)
+
+
+class TestTCGALabelAssignment(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        root = Path(self.tmp.name)
+
+        self.mapping_path = root / "tcga_file_mapping.csv"
+        with open(self.mapping_path, "w") as f:
+            f.write("project,file_name,sample_type\n")
+            f.write("TCGA-BLCA,id0.counts.tsv,Primary Tumor\n")
+            f.write("TCGA-BRCA,id1.counts.tsv,Primary Tumor\n")
+            f.write("TCGA-GBM,id2.counts.tsv,Primary Tumor\n")
+            f.write("TCGA-LGG,id3.counts.tsv,Primary Tumor\n")
+            f.write("TCGA-LUAD,id4.counts.tsv,Primary Tumor\n")
+            f.write("TCGA-UCEC,id5.counts.tsv,Primary Tumor\n")
+            # Filtered out: non-target cohort and non-primary tumor.
+            f.write("TCGA-KIRC,id6.counts.tsv,Primary Tumor\n")
+            f.write("TCGA-BRCA,id7.counts.tsv,Solid Tissue Normal\n")
+
+        self.identifier_path = root / "tcga_preprocessed.csv"
+        with open(self.identifier_path, "w") as f:
+            f.write("geneA,geneB,identifier\n")
+            # Row order matters — must match the embeddings array.
+            for i in range(8):
+                f.write(f"0.0,0.0,id{i}\n")
+
+        self.embeddings_path = root / "emb.npy"
+        self.embeddings = np.arange(8 * 4, dtype=np.float32).reshape(8, 4)
+        np.save(self.embeddings_path, self.embeddings)
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_expected_labels(self):
+        ds = load_tcga_cancer_classification_5cohort(
+            embeddings_path=self.embeddings_path,
+            identifier_csv=self.identifier_path,
+            mapping_csv=self.mapping_path,
+        )
+        self.assertEqual(len(ds), 6)
+
+        labels = []
+        embeddings = []
+        for sample in ds:
+            labels.append(int(sample["label"].item()))
+            embeddings.append(sample["embedding"].numpy())
+        # 6 rows retained (id0..id5), filtered out id6 (wrong cohort) and id7
+        # (not Primary Tumor). Row i in the embeddings matrix aligns with idi.
+        self.assertEqual(labels, [0, 1, 2, 2, 3, 4])
+        np.testing.assert_allclose(np.stack(embeddings), self.embeddings[:6])
+
+    def test_label_map_has_5_distinct_classes(self):
+        self.assertEqual(set(LABEL_MAP.values()), {0, 1, 2, 3, 4})
+
+
+class TestStratifiedSplit(unittest.TestCase):
+    def test_class_proportions_preserved(self):
+        labels = np.array([0] * 20 + [1] * 30 + [2] * 10)
+        train_idx, test_idx = stratified_split_indices(
+            labels, test_ratio=0.2, seed=0
+        )
+        # Every class appears in both splits.
+        for cls in (0, 1, 2):
+            self.assertGreater(int((labels[train_idx] == cls).sum()), 0)
+            self.assertGreater(int((labels[test_idx] == cls).sum()), 0)
+        # No overlap.
+        self.assertEqual(set(train_idx).intersection(set(test_idx)), set())
+        # Total coverage.
+        self.assertEqual(
+            sorted(list(train_idx) + list(test_idx)), list(range(len(labels)))
+        )
+
+    def test_tiny_class_gets_at_least_one_test_sample(self):
+        labels = np.array([0, 0, 1, 1, 1, 1, 1])
+        _, test_idx = stratified_split_indices(labels, test_ratio=0.1, seed=0)
+        # max(1, int(2*0.1)) == 1 for class 0, max(1, int(5*0.1)) == 1 for class 1
+        self.assertEqual(int((labels[test_idx] == 0).sum()), 1)
+        self.assertEqual(int((labels[test_idx] == 1).sum()), 1)
+
+
+class TestTrainerSmoke(unittest.TestCase):
+    def test_train_converges(self):
+        torch.manual_seed(0)
+        dataset = _make_classifier_dataset(n_per_class=30, embed_dim=12, n_classes=3)
+        labels = [int(s["label"].item()) for s in dataset]
+        train_idx, test_idx = stratified_split_indices(labels, test_ratio=0.2, seed=0)
+        train_loader = get_dataloader(
+            dataset.subset(train_idx.tolist()), batch_size=8, shuffle=True
+        )
+        test_loader = get_dataloader(
+            dataset.subset(test_idx.tolist()), batch_size=8, shuffle=False
+        )
+        model = BulkRNABertClassifier(
+            dataset=dataset, hidden_sizes=(16,), embed_dim=12
+        )
+        trainer = Trainer(
+            model=model,
+            metrics=["accuracy", "f1_weighted"],
+            device="cpu",
+            enable_logging=False,
+        )
+        trainer.train(
+            train_dataloader=train_loader,
+            val_dataloader=test_loader,
+            epochs=5,
+            optimizer_params={"lr": 1e-2},
+            monitor="f1_weighted",
+            monitor_criterion="max",
+            load_best_model_at_last=False,
+        )
+        scores = trainer.evaluate(test_loader)
+        # Linearly separable toy problem — the head should comfortably beat chance.
+        self.assertGreater(scores["accuracy"], 0.5)
+
+
+if __name__ == "__main__":
+    unittest.main()

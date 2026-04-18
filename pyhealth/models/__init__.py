@@ -4,6 +4,7 @@ from .base_model import BaseModel
 from .biot import BIOT
 from .bulk_rna_bert import (
     BulkRNABert,
+    BulkRNABertClassifier,
     BulkRNABertConfig,
     bin_expression_values,
     load_expression_csv,

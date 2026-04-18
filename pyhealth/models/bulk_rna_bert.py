@@ -48,7 +48,7 @@ from .base_model import BaseModel
 def bin_expression_values(
     values: np.ndarray | torch.Tensor,
     n_bins: int = 64,
-    normalization_factor: float = 5.547,
+    normalization_factor: float = 5.547176906585117,
     already_log_normalized: bool = True,
 ) -> torch.Tensor:
     """Discretize gene expression values into bin IDs for the discrete MLM mode.
@@ -91,12 +91,15 @@ def bin_expression_values(
         zero_mask = arr <= 0.0
 
     scaled = arr / float(normalization_factor)
-    # np.linspace(0, 1, n_bins) gives n_bins breakpoints, producing n_bins bins
-    # after np.digitize (right=False) clipped to [0, n_bins - 1].
+    # Reference tokenizer (multiomics-open-research): token 0 is reserved for
+    # "zero expression", bins 1..n_bins-1 cover non-zero values, and token
+    # n_bins is saturation. np.digitize(..., np.linspace(0, 1, n_bins))
+    # returns values in [0, n_bins]; we then force strict-zero positions to 0
+    # and clip to [0, n_bins - 1] to stay inside the embedding table.
     breakpoints = np.linspace(0.0, 1.0, n_bins)
-    bin_ids = np.digitize(scaled, breakpoints) - 1
-    bin_ids = np.clip(bin_ids, 0, n_bins - 1)
+    bin_ids = np.digitize(scaled, breakpoints)
     bin_ids[zero_mask] = 0
+    bin_ids = np.clip(bin_ids, 0, n_bins - 1)
     return torch.from_numpy(bin_ids).long()
 
 
@@ -105,7 +108,7 @@ def load_expression_csv(
     *,
     mode: str = "continuous",
     n_bins: int = 64,
-    normalization_factor: float = 5.547,
+    normalization_factor: float = 5.547176906585117,
     drop_columns: Sequence[str] = ("identifier", "cohort"),
     already_log_normalized: bool = False,
 ) -> Tuple[torch.Tensor, List[str]]:
@@ -158,6 +161,7 @@ def load_expression_csv(
     if mode == "continuous":
         if not already_log_normalized:
             values = np.log10(values + 1.0)
+        values = values / float(normalization_factor)
         return torch.from_numpy(values).float(), gene_names
 
     tokens = bin_expression_values(
@@ -668,9 +672,162 @@ class BulkRNABert(BaseModel):
             "predictions": predictions,
         }
 
+    # ------------------------------------------------------------------
+    # Embedding extraction
+    # ------------------------------------------------------------------
+
+    @torch.no_grad()
+    def encode(self, expression: torch.Tensor) -> torch.Tensor:
+        """Return last-layer encoder output, mean-pooled over genes.
+
+        Runs a no-mask forward pass through the embedding + Transformer stack
+        and averages the resulting ``(B, n_genes, embed_dim)`` tensor over the
+        gene axis. Used to pre-compute per-sample embeddings for downstream
+        tasks (e.g. cancer classification) that train only a classifier head
+        on top of frozen BulkRNABert representations.
+
+        Args:
+            expression: Expression tensor of shape ``(B, n_genes)``. For
+                ``discrete`` mode this must contain bin IDs in ``[0, n_bins)``;
+                for ``continuous`` mode it must contain ``log10(TPM + 1)``
+                values.
+
+        Returns:
+            A tensor of shape ``(B, embed_dim)`` on the model's device.
+        """
+        cfg = self.config
+        expression = expression.to(self.device)
+        was_training = self.training
+        self.eval()
+        try:
+            if cfg.expression_mode == "discrete":
+                expression = expression.long()
+                if expression.dim() != 2 or expression.shape[1] != cfg.n_genes:
+                    raise ValueError(
+                        f"discrete encode expects shape (B, {cfg.n_genes}), got "
+                        f"{tuple(expression.shape)}"
+                    )
+                x = self.expression_embedding(expression)
+            else:
+                expression = expression.float()
+                if expression.dim() != 2 or expression.shape[1] != cfg.n_genes:
+                    raise ValueError(
+                        f"continuous encode expects shape (B, {cfg.n_genes}), got "
+                        f"{tuple(expression.shape)}"
+                    )
+                model_mask = torch.zeros_like(expression, dtype=torch.bool)
+                x = self.expression_embedding(expression, model_mask)
+            x = self._encode(x)  # (B, L, E)
+            return x.mean(dim=1)  # (B, E)
+        finally:
+            self.train(was_training)
+
+
+# ---------------------------------------------------------------------------
+# Downstream: cancer-type classification head
+# ---------------------------------------------------------------------------
+
+
+class BulkRNABertClassifier(BaseModel):
+    """MLP classifier head trained on pre-computed BulkRNABert embeddings.
+
+    This model implements the "pattern 2" downstream workflow: per-sample
+    embeddings produced by :meth:`BulkRNABert.encode` are saved to disk once,
+    and this lightweight head is trained on top of them. The encoder is not
+    invoked during training — the input feature is already a fixed
+    ``(embed_dim,)`` vector per sample.
+
+    Architecture matches the reference ``RNASeqSurvivalMLP`` used in the
+    BulkRNABert paper's downstream experiments: a stack of Linear + SELU
+    hidden layers followed by a final Linear projection to ``num_classes``.
+    Dropout and layer norm are disabled by default to follow the reference
+    checkpoint configuration.
+
+    Args:
+        dataset: A PyHealth :class:`~pyhealth.datasets.SampleDataset` whose
+            ``input_schema`` exposes a single float-array feature holding the
+            pre-computed embedding and whose ``output_schema`` exposes a
+            single multiclass label.
+        hidden_sizes: Sizes of the hidden Linear layers. Defaults to
+            ``(256, 128)`` to match the reference head.
+        embed_dim: Dimensionality of the input embedding. Defaults to
+            ``256`` (the BulkRNABert encoder output size).
+        num_classes: Number of output classes. When ``None`` (default) the
+            size is inferred from the dataset's label processor.
+        dropout: Dropout probability applied after each hidden activation.
+            Defaults to ``0.0`` (disabled) per the reference checkpoint.
+        layer_norm: If ``True``, apply :class:`~torch.nn.LayerNorm` before
+            the first hidden layer. Defaults to ``False``.
+        feature_key: Name of the embedding feature in the batch dict. When
+            ``None``, inferred from ``dataset.input_schema``.
+        label_key: Name of the label key in the batch dict. When ``None``,
+            inferred from ``dataset.output_schema``.
+
+    Forward returns a dict with ``loss``, ``y_prob``, ``y_true`` and
+    ``logit`` keys, matching the PyHealth :class:`~pyhealth.trainer.Trainer`
+    contract.
+    """
+
+    def __init__(
+        self,
+        dataset,
+        hidden_sizes: Sequence[int] = (256, 128),
+        embed_dim: int = 256,
+        num_classes: Optional[int] = None,
+        dropout: float = 0.0,
+        layer_norm: bool = False,
+        feature_key: Optional[str] = None,
+        label_key: Optional[str] = None,
+    ):
+        super().__init__(dataset=dataset)
+        if not self.feature_keys:
+            raise ValueError(
+                "dataset.input_schema is empty; cannot infer feature_key"
+            )
+        if not self.label_keys:
+            raise ValueError(
+                "dataset.output_schema is empty; cannot infer label_key"
+            )
+        self.feature_key = feature_key or self.feature_keys[0]
+        self.label_key = label_key or self.label_keys[0]
+        self.embed_dim = embed_dim
+        self.mode = "multiclass"
+        if num_classes is None:
+            num_classes = self.get_output_size()
+        self.num_classes = num_classes
+
+        layers: List[nn.Module] = []
+        if layer_norm:
+            layers.append(nn.LayerNorm(embed_dim))
+        in_dim = embed_dim
+        for hidden in hidden_sizes:
+            layers.append(nn.Linear(in_dim, hidden))
+            layers.append(nn.SELU())
+            if dropout > 0:
+                layers.append(nn.Dropout(dropout))
+            in_dim = hidden
+        self.backbone = nn.Sequential(*layers)
+        self.classifier = nn.Linear(in_dim, num_classes)
+
+    def forward(self, **kwargs) -> Dict[str, torch.Tensor]:
+        x = kwargs[self.feature_key].to(self.device).float()
+        if x.dim() != 2 or x.shape[1] != self.embed_dim:
+            raise ValueError(
+                f"expected input of shape (B, {self.embed_dim}), got "
+                f"{tuple(x.shape)}"
+            )
+        h = self.backbone(x)
+        logits = self.classifier(h)
+
+        y_true = kwargs[self.label_key].to(self.device).long()
+        loss = self.get_loss_function()(logits, y_true)
+        y_prob = self.prepare_y_prob(logits)
+        return {"loss": loss, "y_prob": y_prob, "y_true": y_true, "logit": logits}
+
 
 __all__ = [
     "BulkRNABert",
+    "BulkRNABertClassifier",
     "BulkRNABertConfig",
     "bin_expression_values",
 ]
