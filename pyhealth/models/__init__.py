@@ -2,6 +2,12 @@ from .adacare import AdaCare, AdaCareLayer, MultimodalAdaCare
 from .agent import Agent, AgentLayer
 from .base_model import BaseModel
 from .biot import BIOT
+from .bulk_rna_bert import (
+    BulkRNABert,
+    BulkRNABertConfig,
+    bin_expression_values,
+    load_expression_csv,
+)
 from .cnn import CNN, CNNLayer
 from .concare import ConCare, ConCareLayer
 from .contrawr import ContraWR, ResBlock2D
