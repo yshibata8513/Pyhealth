@@ -1,36 +1,40 @@
-"""Factory for loading pre-computed BulkRNABert embeddings for downstream tasks.
+"""TCGA RNA-seq embedding dataset + factory for 5-cohort cancer classification.
 
-The :func:`load_tcga_cancer_classification_5cohort` factory assembles an
-:class:`~pyhealth.datasets.InMemorySampleDataset` whose samples carry
-per-patient BulkRNABert encoder outputs (shape ``(embed_dim,)``) together
-with a TCGA cancer-type label. It is the PyHealth-native entry point for
-the "pattern 2" workflow, where pre-training embeddings are saved once and
-only a classifier head is trained on them.
+This module pairs pre-computed :class:`~pyhealth.models.BulkRNABert` encoder
+outputs (``.npy``) with TCGA cancer-type labels resolved from the GDC file
+mapping CSV. It exposes two entry points:
 
-Inputs expected on disk:
+* :class:`TCGARNASeqEmbeddingDataset` — a full :class:`~pyhealth.datasets.BaseDataset`
+  subclass that merges the ``.npy`` matrix and the identifier / mapping CSVs
+  into a single cache CSV and then loads it through the standard YAML-driven
+  loader. Pair with :class:`~pyhealth.tasks.TCGACancerClassification5Cohort`
+  via ``dataset.set_task(task)``. Use this path for full-pipeline workflows.
+
+* :func:`load_tcga_cancer_classification_5cohort` — a thin shortcut that
+  returns an :class:`~pyhealth.datasets.InMemorySampleDataset` directly,
+  skipping the BaseDataset event-dataframe round-trip. Useful for small
+  experiments and unit tests.
+
+Inputs expected on disk (both entry points):
 
 * ``embeddings_path`` — ``.npy`` file produced by
-  ``examples/bulk_rna_bert_extract_embeddings.py``. Row ``i`` of this file
-  must correspond to row ``i`` of ``identifier_csv`` (i.e. the preprocessed
-  TCGA CSV used for pre-training).
-* ``identifier_csv`` — the same ``tcga_preprocessed.csv`` used during
-  pre-training. Only the ``identifier`` column is read here.
+  ``examples/tcga_rnaseq_extract_embeddings_bulk_rna_bert.py``. Row ``i``
+  of this file must correspond to row ``i`` of ``identifier_csv``.
+* ``identifier_csv`` — the preprocessed TCGA CSV (``tcga_preprocessed.csv``)
+  used during pre-training. Only the ``identifier`` column is consumed here.
 * ``mapping_csv`` — ``tcga_file_mapping.csv`` from the TCGA GDC metadata
-  dump. The factory joins ``identifier == file_name.split(".")[0]`` and
-  filters to ``sample_type == "Primary Tumor"`` and ``project`` in the
-  five target cohorts.
-
-All 5-cohort samples are returned in a single dataset; splitting into
-train / val / test is the caller's responsibility (see
-:func:`stratified_split_indices`).
+  dump. The joiner filters to ``sample_type == "Primary Tumor"`` and
+  ``project`` in the five target cohorts, then keys on
+  ``identifier == file_name.split(".")[0]``.
 """
 
 from __future__ import annotations
 
 import csv
+import json
 import logging
 from pathlib import Path
-from typing import List, Tuple
+from typing import List, Optional, Tuple
 
 import numpy as np
 
@@ -39,9 +43,12 @@ from pyhealth.tasks.tcga_cancer_classification_5cohort import (
     TCGACancerClassification5Cohort,
 )
 
+from .base_dataset import BaseDataset
 from .sample_dataset import InMemorySampleDataset, create_sample_dataset
 
 logger = logging.getLogger(__name__)
+
+MERGED_CSV_NAME = "tcga_rnaseq_embedding.csv"
 
 
 def _build_identifier_to_label(mapping_csv: str | Path) -> dict[str, int]:
@@ -62,17 +69,24 @@ def _build_identifier_to_label(mapping_csv: str | Path) -> dict[str, int]:
     return identifier_to_label
 
 
+def _identifier_to_cohort(mapping_csv: str | Path) -> dict[str, str]:
+    """Like :func:`_build_identifier_to_label` but returns the raw cohort tag."""
+    out: dict[str, str] = {}
+    with open(mapping_csv) as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            if row["project"] in LABEL_MAP and row["sample_type"] == "Primary Tumor":
+                key = row["file_name"].split(".")[0]
+                out[key] = row["project"]
+    return out
+
+
 def _select_rows(
     embeddings: np.ndarray,
     identifier_csv: str | Path,
     identifier_to_label: dict[str, int],
 ) -> Tuple[np.ndarray, List[int], List[str]]:
-    """Slice ``embeddings`` to rows whose identifier is in the label map.
-
-    Returns the selected embedding matrix, the integer labels, and the
-    identifier strings (for traceability). The row order in the returned
-    arrays matches their first-encountered order in ``identifier_csv``.
-    """
+    """Slice ``embeddings`` to rows whose identifier is in the label map."""
     with open(identifier_csv) as f:
         header = f.readline().rstrip("\n").split(",")
         if header[-1] != "identifier":
@@ -108,6 +122,145 @@ def _select_rows(
     return selected, labels, identifiers
 
 
+def _build_merged_csv(
+    embeddings_path: str | Path,
+    identifier_csv: str | Path,
+    mapping_csv: str | Path,
+    out_csv: str | Path,
+) -> None:
+    """Materialize ``{patient_id, cohort, embedding_json}`` rows to ``out_csv``.
+
+    The embedding is serialized as a JSON list of floats so the whole table
+    fits in a single CSV and can be loaded through the standard BaseDataset
+    YAML path without bespoke readers.
+    """
+    embeddings = np.load(embeddings_path).astype(np.float32)
+    if embeddings.ndim != 2:
+        raise ValueError(
+            f"embeddings must be 2-D (n_samples, embed_dim), got shape "
+            f"{embeddings.shape}"
+        )
+    identifier_to_cohort = _identifier_to_cohort(mapping_csv)
+    with open(identifier_csv) as f:
+        header = f.readline().rstrip("\n").split(",")
+        if header[-1] != "identifier":
+            raise ValueError(
+                f"{identifier_csv}: last column must be 'identifier', got "
+                f"{header[-1]!r}"
+            )
+        rows: List[Tuple[str, str, str]] = []
+        for row_idx, line in enumerate(f):
+            identifier = line.rstrip("\n").rsplit(",", 1)[-1]
+            cohort = identifier_to_cohort.get(identifier)
+            if cohort is None:
+                continue
+            if row_idx >= embeddings.shape[0]:
+                raise ValueError(
+                    f"identifier CSV has row index {row_idx} but embeddings "
+                    f"has only {embeddings.shape[0]} rows — mismatched files?"
+                )
+            emb_json = json.dumps(embeddings[row_idx].tolist())
+            rows.append((identifier, cohort, emb_json))
+
+    if not rows:
+        raise ValueError(
+            "No rows in the identifier CSV matched any label in the mapping "
+            "CSV. Check that the two files cover the same cohort."
+        )
+
+    out_csv = Path(out_csv)
+    out_csv.parent.mkdir(parents=True, exist_ok=True)
+    with open(out_csv, "w", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow(["patient_id", "cohort", "embedding_json"])
+        writer.writerows(rows)
+    logger.info("Wrote merged TCGA embedding CSV to %s (%d rows)",
+                out_csv, len(rows))
+
+
+class TCGARNASeqEmbeddingDataset(BaseDataset):
+    """BaseDataset wrapper over pre-computed BulkRNABert TCGA embeddings.
+
+    The dataset materializes (once, lazily) a merged CSV with columns
+    ``patient_id``, ``cohort``, ``embedding_json`` under ``root``, then
+    loads it through the standard :class:`~pyhealth.datasets.BaseDataset`
+    YAML path. Pair with :class:`~pyhealth.tasks.TCGACancerClassification5Cohort`:
+
+    .. code-block:: python
+
+        from pyhealth.datasets import TCGARNASeqEmbeddingDataset
+        from pyhealth.tasks import TCGACancerClassification5Cohort
+
+        dataset = TCGARNASeqEmbeddingDataset(
+            root="/path/to/tcga",
+            embeddings_path="/path/to/tcga_discrete_refinit_step600.npy",
+            identifier_csv="/path/to/tcga_preprocessed.csv",
+            mapping_csv="/path/to/tcga_file_mapping.csv",
+        )
+        samples = dataset.set_task(TCGACancerClassification5Cohort())
+
+    Args:
+        root: Directory used to host the generated merged CSV
+            (``tcga_rnaseq_embedding.csv``). A pre-existing CSV in this
+            directory will be reused.
+        embeddings_path: Path to the ``.npy`` embedding matrix. Ignored
+            if the merged CSV already exists at ``root``.
+        identifier_csv: Path to ``tcga_preprocessed.csv`` (only the
+            ``identifier`` column is consumed).
+        mapping_csv: Path to ``tcga_file_mapping.csv``.
+        tables: Tables to load. Defaults to ``["rnaseq_embedding"]`` which
+            matches the shipped YAML.
+        dataset_name: Optional override for :attr:`BaseDataset.dataset_name`.
+        config_path: Optional override for the YAML config. Defaults to
+            ``configs/tcga_rnaseq_embedding.yaml`` shipped alongside this
+            module.
+        **kwargs: Forwarded to :meth:`BaseDataset.__init__`.
+    """
+
+    def __init__(
+        self,
+        root: str | Path,
+        embeddings_path: Optional[str | Path] = None,
+        identifier_csv: Optional[str | Path] = None,
+        mapping_csv: Optional[str | Path] = None,
+        tables: Optional[List[str]] = None,
+        dataset_name: Optional[str] = None,
+        config_path: Optional[str] = None,
+        **kwargs,
+    ) -> None:
+        root_path = Path(root)
+        root_path.mkdir(parents=True, exist_ok=True)
+        merged_csv = root_path / MERGED_CSV_NAME
+        if not merged_csv.exists():
+            if embeddings_path is None or identifier_csv is None or mapping_csv is None:
+                raise ValueError(
+                    f"{merged_csv} does not exist and one of "
+                    "embeddings_path / identifier_csv / mapping_csv was not "
+                    "provided. Pass all three to build the merged CSV."
+                )
+            _build_merged_csv(
+                embeddings_path, identifier_csv, mapping_csv, merged_csv
+            )
+
+        if config_path is None:
+            config_path = str(
+                Path(__file__).parent / "configs" / "tcga_rnaseq_embedding.yaml"
+            )
+
+        super().__init__(
+            root=str(root_path),
+            tables=list(tables or ["rnaseq_embedding"]),
+            dataset_name=dataset_name or "tcga_rnaseq_embedding",
+            config_path=config_path,
+            **kwargs,
+        )
+
+    @property
+    def default_task(self) -> TCGACancerClassification5Cohort:
+        """The 5-cohort classification task is the canonical pairing."""
+        return TCGACancerClassification5Cohort()
+
+
 def load_tcga_cancer_classification_5cohort(
     embeddings_path: str | Path,
     identifier_csv: str | Path,
@@ -115,6 +268,11 @@ def load_tcga_cancer_classification_5cohort(
     dataset_name: str = "TCGA_BulkRNABert_Embeddings",
 ) -> InMemorySampleDataset:
     """Build an in-memory SampleDataset of pre-computed BulkRNABert embeddings.
+
+    Thin shortcut around :class:`TCGARNASeqEmbeddingDataset` that bypasses
+    the event-dataframe materialization and returns samples directly. Used
+    by unit tests and short experiments where the BaseDataset caching
+    overhead is not justified.
 
     Args:
         embeddings_path: Path to the ``.npy`` file holding all TCGA
@@ -218,6 +376,7 @@ def stratified_split_indices(
 
 
 __all__ = [
+    "TCGARNASeqEmbeddingDataset",
     "load_tcga_cancer_classification_5cohort",
     "stratified_split_indices",
 ]

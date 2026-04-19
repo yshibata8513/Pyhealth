@@ -247,7 +247,11 @@ class TestLoadExpressionCSV(unittest.TestCase):
         self.assertEqual(genes, self.cols)
         self.assertEqual(tensor.shape, (self.n_samples, self.n_genes))
         self.assertEqual(tensor.dtype, torch.float32)
-        expected = np.log10(self.tpm + 1.0).astype(np.float32)
+        # Continuous mode applies the same normalization_factor as discrete
+        # tokenization so the model sees inputs on a consistent scale; see
+        # reference dataloader.py :: load_continuous.
+        norm = 5.547176906585117
+        expected = (np.log10(self.tpm + 1.0) / norm).astype(np.float32)
         np.testing.assert_allclose(tensor.numpy(), expected, rtol=1e-5)
 
     def test_discrete_returns_long_tokens(self):
@@ -281,8 +285,9 @@ class TestLoadExpressionCSV(unittest.TestCase):
         tensor, _ = load_expression_csv(
             logged_path, mode="continuous", already_log_normalized=True
         )
+        norm = 5.547176906585117
         np.testing.assert_allclose(
-            tensor.numpy(), logged.astype(np.float32), rtol=1e-5
+            tensor.numpy(), (logged / norm).astype(np.float32), rtol=1e-5
         )
 
     def test_feeds_into_model(self):

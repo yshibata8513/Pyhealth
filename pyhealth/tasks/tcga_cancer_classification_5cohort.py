@@ -1,26 +1,32 @@
 """5-cohort TCGA cancer-type classification task for BulkRNABert embeddings.
 
-This task defines the input / output schema used by
-:func:`pyhealth.datasets.load_tcga_cancer_classification_5cohort` and the
-:class:`~pyhealth.models.BulkRNABertClassifier` downstream head. Samples
-consist of a pre-computed ``(embed_dim,)`` BulkRNABert encoder output and
-an integer cancer-type label in ``{0, 1, 2, 3, 4}`` corresponding to the
-five cohorts (BLCA, BRCA, GBM+LGG, LUAD, UCEC) used in the reference
-experiments.
+This task pairs a pre-computed :class:`~pyhealth.models.BulkRNABert` encoder
+output (shape ``(embed_dim,)``) with an integer cancer-type label in
+``{0, 1, 2, 3, 4}`` corresponding to the five cohorts
+(BLCA, BRCA, GBM+LGG, LUAD, UCEC) used in the reference experiments.
 
-Unlike most PyHealth tasks, ``__call__`` is a no-op here: the TCGA inputs
-live as wide CSV / NPY matrices rather than per-patient event streams, so
-the dataset factory constructs sample dicts directly and ``set_task`` is
-not part of the pipeline. ``input_schema`` / ``output_schema`` remain
-authoritative so :class:`~pyhealth.datasets.SampleBuilder` and the model
-can query them as usual.
+The :meth:`TCGACancerClassification5Cohort.__call__` hook expects a
+:class:`~pyhealth.data.Patient` whose ``rnaseq_embedding`` event carries
+``cohort`` (string like ``"TCGA-BLCA"``) and ``embedding_json`` (JSON-
+encoded list of floats), which is the format produced by
+:class:`~pyhealth.datasets.TCGARNASeqEmbeddingDataset`. For the shortcut
+factory :func:`~pyhealth.datasets.load_tcga_cancer_classification_5cohort`
+this hook is not consulted because samples are assembled up-front; the
+schemas here still apply and are read by
+:class:`~pyhealth.datasets.SampleBuilder`.
 """
 
 from __future__ import annotations
 
-from typing import Dict, List
+import json
+import logging
+from typing import Any, Dict, List
+
+import numpy as np
 
 from .base_task import BaseTask
+
+logger = logging.getLogger(__name__)
 
 
 LABEL_MAP: Dict[str, int] = {
@@ -51,13 +57,60 @@ class TCGACancerClassification5Cohort(BaseTask):
     input_schema: Dict[str, str] = {"embedding": "tensor"}
     output_schema: Dict[str, str] = {"label": "multiclass"}
 
-    def __call__(self, patient) -> List[Dict]:  # pragma: no cover - unused
-        raise NotImplementedError(
-            "TCGACancerClassification5Cohort does not use the patient-level "
-            "set_task pipeline. Use "
-            "pyhealth.datasets.load_tcga_cancer_classification_5cohort to "
-            "construct an InMemorySampleDataset directly."
-        )
+    def __call__(self, patient: Any) -> List[Dict[str, Any]]:
+        """Extract an ``(embedding, label)`` sample for one TCGA patient.
+
+        Reads the single ``rnaseq_embedding`` event emitted by
+        :class:`~pyhealth.datasets.TCGARNASeqEmbeddingDataset` and converts
+        it to the schema declared on this task. Patients whose cohort tag
+        is not in :data:`LABEL_MAP` or who lack the event (e.g. filtered
+        out upstream) contribute zero samples.
+
+        Args:
+            patient: A :class:`~pyhealth.data.Patient` with a
+                ``rnaseq_embedding`` event carrying ``cohort`` and
+                ``embedding_json`` attributes.
+
+        Returns:
+            Either an empty list (patient not in the 5-cohort set) or a
+            single-entry list with the ``patient_id`` / ``embedding`` /
+            ``label`` sample dict.
+        """
+        events = patient.get_events(event_type="rnaseq_embedding")
+        if not events:
+            return []
+        if len(events) > 1:
+            logger.warning(
+                "Patient %s has %d rnaseq_embedding events; using the first.",
+                patient.patient_id,
+                len(events),
+            )
+        event = events[0]
+
+        cohort = getattr(event, "cohort", None)
+        if cohort not in LABEL_MAP:
+            return []
+
+        raw = getattr(event, "embedding_json", None)
+        if raw is None:
+            return []
+        try:
+            embedding = np.asarray(json.loads(raw), dtype=np.float32)
+        except (TypeError, ValueError) as exc:
+            logger.warning(
+                "Patient %s has malformed embedding_json (%s); skipping.",
+                patient.patient_id,
+                exc,
+            )
+            return []
+
+        return [
+            {
+                "patient_id": patient.patient_id,
+                "embedding": embedding,
+                "label": LABEL_MAP[cohort],
+            }
+        ]
 
 
 __all__ = [

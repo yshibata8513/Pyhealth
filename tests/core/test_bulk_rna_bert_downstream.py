@@ -25,6 +25,7 @@ import numpy as np
 import torch
 
 from pyhealth.datasets import (
+    TCGARNASeqEmbeddingDataset,
     create_sample_dataset,
     get_dataloader,
     load_tcga_cancer_classification_5cohort,
@@ -287,6 +288,116 @@ class TestTrainerSmoke(unittest.TestCase):
         scores = trainer.evaluate(test_loader)
         # Linearly separable toy problem — the head should comfortably beat chance.
         self.assertGreater(scores["accuracy"], 0.5)
+
+
+def _build_synthetic_sources(root: Path, n: int = 6, embed_dim: int = 4):
+    """Write the trio of files the Dataset / factory expect."""
+    mapping = root / "tcga_file_mapping.csv"
+    with open(mapping, "w") as f:
+        f.write("project,file_name,sample_type\n")
+        f.write("TCGA-BLCA,id0.counts.tsv,Primary Tumor\n")
+        f.write("TCGA-BRCA,id1.counts.tsv,Primary Tumor\n")
+        f.write("TCGA-GBM,id2.counts.tsv,Primary Tumor\n")
+        f.write("TCGA-LGG,id3.counts.tsv,Primary Tumor\n")
+        f.write("TCGA-LUAD,id4.counts.tsv,Primary Tumor\n")
+        f.write("TCGA-UCEC,id5.counts.tsv,Primary Tumor\n")
+
+    identifier_csv = root / "tcga_preprocessed.csv"
+    with open(identifier_csv, "w") as f:
+        f.write("geneA,geneB,identifier\n")
+        for i in range(n):
+            f.write(f"0.0,0.0,id{i}\n")
+
+    embeddings_path = root / "emb.npy"
+    embeddings = np.arange(n * embed_dim, dtype=np.float32).reshape(n, embed_dim)
+    np.save(embeddings_path, embeddings)
+    return mapping, identifier_csv, embeddings_path, embeddings
+
+
+class _DummyEvent:
+    def __init__(self, **kwargs):
+        self.__dict__.update(kwargs)
+
+
+class _DummyPatient:
+    def __init__(self, patient_id, events):
+        self.patient_id = patient_id
+        self._events = events
+
+    def get_events(self, event_type=None):
+        if event_type is None:
+            return list(self._events)
+        return [e for e in self._events if getattr(e, "event_type", None) == event_type]
+
+
+class TestTaskCall(unittest.TestCase):
+    def test_in_map_returns_single_sample(self):
+        event = _DummyEvent(
+            event_type="rnaseq_embedding",
+            cohort="TCGA-BLCA",
+            embedding_json="[1.0, 2.0, 3.0]",
+        )
+        patient = _DummyPatient("id0", [event])
+        task = TCGACancerClassification5Cohort()
+        samples = task(patient)
+        self.assertEqual(len(samples), 1)
+        s = samples[0]
+        self.assertEqual(s["patient_id"], "id0")
+        self.assertEqual(s["label"], 0)
+        np.testing.assert_allclose(s["embedding"], [1.0, 2.0, 3.0])
+        self.assertEqual(s["embedding"].dtype, np.float32)
+
+    def test_out_of_map_returns_empty(self):
+        event = _DummyEvent(
+            event_type="rnaseq_embedding",
+            cohort="TCGA-KIRC",  # not in LABEL_MAP
+            embedding_json="[1.0]",
+        )
+        task = TCGACancerClassification5Cohort()
+        self.assertEqual(task(_DummyPatient("x", [event])), [])
+
+    def test_missing_event_returns_empty(self):
+        task = TCGACancerClassification5Cohort()
+        self.assertEqual(task(_DummyPatient("x", [])), [])
+
+
+class TestTCGARNASeqEmbeddingDataset(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self.tmp.name)
+        self.cache = Path(self.tmp.name) / "cache"
+        mapping, id_csv, emb_path, self.emb = _build_synthetic_sources(
+            self.root, n=6, embed_dim=4
+        )
+        self.dataset = TCGARNASeqEmbeddingDataset(
+            root=str(self.root),
+            embeddings_path=emb_path,
+            identifier_csv=id_csv,
+            mapping_csv=mapping,
+            cache_dir=str(self.cache),
+        )
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_merged_csv_materialized(self):
+        self.assertTrue((self.root / "tcga_rnaseq_embedding.csv").exists())
+
+    def test_unique_patient_ids(self):
+        # 6 rows, all map to a cohort in LABEL_MAP -> 6 patients.
+        self.assertEqual(set(self.dataset.unique_patient_ids), {f"id{i}" for i in range(6)})
+
+    def test_set_task_end_to_end(self):
+        samples = self.dataset.set_task(TCGACancerClassification5Cohort())
+        self.assertEqual(len(samples), 6)
+        labels = sorted(int(s["label"].item()) for s in samples)
+        # LABEL_MAP ordering yields {0,1,2,2,3,4} across id0..id5.
+        self.assertEqual(labels, [0, 1, 2, 2, 3, 4])
+
+    def test_default_task(self):
+        self.assertIsInstance(
+            self.dataset.default_task, TCGACancerClassification5Cohort
+        )
 
 
 if __name__ == "__main__":
