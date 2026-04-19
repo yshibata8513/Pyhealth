@@ -28,11 +28,11 @@ Ablation study: discrete vs continuous expression mode
 The BulkRNABert encoder supports two expression encodings: a 64-bin
 tokenization of ``log10(TPM+1)/normalization_factor`` (**discrete**, the
 encoding used in Gelard et al. 2024) and a direct continuous projection of
-``log10(TPM+1)/normalization_factor`` (**continuous**, implemented in the
-reference repository but *not* reported as a benchmark in the paper). The
-classifier head, split, seed, and all hyperparameters are held constant,
-so any difference in downstream F1 is attributable to what the upstream
-encoder preserved about low-expression resolution.
+``log10(TPM+1)/normalization_factor`` (**continuous**, *not* reported as a
+benchmark in the paper). The classifier head, split, seed, and all
+hyperparameters are held constant, so any difference in downstream F1 is
+attributable to what the upstream encoder preserved about low-expression
+resolution.
 
 Observed on TCGA 5-cohort (11,504 samples, step-600 ref-init ckpts,
 seed=42, stratified 80/20 split, head MLP [256, 128] SELU, Adam lr=1e-3,
@@ -56,6 +56,9 @@ unexplored.
 Val and test dataloaders use the same held-out split (known limitation
 that the reference pipeline shares — it defines no separate validation
 cohort either).
+
+Upstream: ``tcga_rnaseq_mlm_bulk_rna_bert.py`` (pretrain) →
+``tcga_rnaseq_extract_embeddings_bulk_rna_bert.py`` (embedding extraction).
 """
 
 from __future__ import annotations

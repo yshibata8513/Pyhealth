@@ -15,6 +15,9 @@ Usage example:
         --csv-path ../multiomics-open-research/output/tcga_preprocessed.csv \\
         --output-path output/embeddings/tcga_discrete_refinit_step600.npy \\
         --batch-size 32
+
+Previous: ``tcga_rnaseq_mlm_bulk_rna_bert.py``. Next:
+``tcga_cancer_classification_5cohort_bulk_rna_bert.py``.
 """
 
 from __future__ import annotations

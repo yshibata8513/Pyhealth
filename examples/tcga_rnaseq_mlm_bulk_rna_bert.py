@@ -17,6 +17,8 @@ Checkpoints are written to ``<output-dir>/step_{N}/`` as ``params.pt`` +
 ``config.json`` every ``--save-every`` effective steps. Receiving SIGTERM (for
 example from the companion GPU temperature watchdog) triggers a graceful stop
 that writes one last checkpoint before exiting.
+
+Next step: ``tcga_rnaseq_extract_embeddings_bulk_rna_bert.py``.
 """
 
 from __future__ import annotations
