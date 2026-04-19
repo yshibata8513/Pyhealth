@@ -10,7 +10,7 @@ classifier can be trained with
 
 Usage example:
 
-    python examples/bulk_rna_bert_extract_embeddings.py \\
+    python examples/tcga_rnaseq_extract_embeddings_bulk_rna_bert.py \\
         --ckpt-dir output/bulk_rna_bert_pretrain_tcga_discrete_refinit/step_600 \\
         --csv-path ../multiomics-open-research/output/tcga_preprocessed.csv \\
         --output-path output/embeddings/tcga_discrete_refinit_step600.npy \\

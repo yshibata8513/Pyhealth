@@ -2,12 +2,12 @@
 
 This example implements the "pattern 2" downstream workflow: the BulkRNABert
 encoder output is assumed to be pre-computed (see
-``bulk_rna_bert_extract_embeddings.py``) and only a lightweight MLP head is
+``tcga_rnaseq_extract_embeddings_bulk_rna_bert.py``) and only a lightweight MLP head is
 trained on top of the frozen embeddings.
 
 Usage example:
 
-    python examples/bulk_rna_bert_cancer_classification.py \\
+    python examples/tcga_cancer_classification_5cohort_bulk_rna_bert.py \\
         --embeddings-path output/embeddings/tcga_discrete_refinit_step600.npy \\
         --identifier-csv ../multiomics-open-research/output/tcga_preprocessed.csv \\
         --mapping-csv ../multiomics-open-research/data/tcga/tcga_file_mapping.csv \\

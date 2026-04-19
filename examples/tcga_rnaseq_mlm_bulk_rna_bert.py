@@ -2,7 +2,7 @@
 
 Usage example (discrete MLM, paper config):
 
-    python examples/bulk_rna_bert_pretrain.py \\
+    python examples/tcga_rnaseq_mlm_bulk_rna_bert.py \\
         --csv-path ../multiomics-open-research/output/tcga_preprocessed.csv \\
         --output-dir output/bulk_rna_bert_pretrain_tcga_discrete \\
         --mode discrete --micro-batch-size 2 --accumulation-steps 80 \\
